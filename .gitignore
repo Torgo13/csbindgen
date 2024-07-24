@@ -18,3 +18,5 @@ unity-sandbox/Library
 unity-sandbox/Logs/
 
 csbindgen-tests/src/lz4.rs
+
+puzzles/c/puzzles
