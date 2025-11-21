@@ -5,13 +5,9 @@ Generate C# FFI from Rust for automatically brings native code and C native libr
 
 Automatically generates C# `DllImport` code from Rust `extern "C" fn` code. Whereas DllImport defaults to the Windows calling convention and requires a lot of configuration for C calls, csbindgen generates code optimized for "Cdecl" calls. Also .NET and Unity have different callback invocation methods (.NET uses function pointers, while Unity uses MonoPInvokeCallback), but you can output code for either by configuration.
 
-When used with Rust's excellent C integration, you can also bring C libraries into C#.
+When used with Rust's excellent C integration, you can also bring C libraries into C#. [rust-bindgen](https://crates.io/crates/bindgen) is a proven `.h` parsing library with extensive track record. By using it together with csbindgen, you can generate code to call C code. In this case, you don't need a Rust native library - all you need is the C/C++ binary and C#.
 
-There are usually many pains involved in using the C Library with C#. Not only is it difficult to create bindings, but cross-platform builds are very difficult. In this day and age, you have to build for multiple platforms and architectures, windows, osx, linux, android, ios, each with x64, x86, arm.
-
-[Rust](https://www.rust-lang.org/) has an excellent toolchain for cross-platform builds, as well as [cc crate](https://crates.io/crates/cc), [cmake crate](https://crates.io/crates/cmake) allow C source code to be integrated into the build. And [rust-bindgen](https://crates.io/crates/bindgen), which generates bindings from `.h`, is highly functional and very stable.
-
-csbindgen can easily bring native C libraries into C# through Rust. csbindgen generates Rust extern code and C# DllImport code to work with C# from code generated from C by bindgen. With cc crate or cmake crate, C code is linked to the single rust native library.
+Additionally, [Rust](https://www.rust-lang.org/) has an excellent toolchain for cross-platform builds, and the [cc crate](https://crates.io/crates/cc) and [cmake crate](https://crates.io/crates/cmake) allow C source code to be integrated into the build. When used together with these, it also supports consolidating multiple native calls and simplifying them into Rust calls.
 
 showcase:
 * [lz4_bindgen.cs](https://github.com/Cysharp/csbindgen/blob/47fd97eb379beeb278d7546c6d0b9a404b28fbd1/dotnet-sandbox/lz4_bindgen.cs) : [LZ4](https://github.com/lz4/lz4) compression library C# binding
@@ -20,6 +16,7 @@ showcase:
 * [bullet3_bindgen.cs](https://github.com/Cysharp/csbindgen/blob/47fd97eb379beeb278d7546c6d0b9a404b28fbd1/dotnet-sandbox/bullet3_bindgen.cs) : [Bullet Physics SDK](https://github.com/bulletphysics/bullet3) C# binding
 * [sqlite3_bindgen.cs](https://github.com/Cysharp/csbindgen/blob/47fd97eb379beeb278d7546c6d0b9a404b28fbd1/dotnet-sandbox/sqlite3_bindgen.cs) : [SQLite](https://www.sqlite.org/index.html) C# binding
 * [Cysharp/YetAnotherHttpHandler](https://github.com/Cysharp/YetAnotherHttpHandler) : brings the power of HTTP/2 (and gRPC) to Unity and .NET Standard
+* [Cysharp/NativeCompressions](https://github.com/Cysharp/NativeCompressions) : LZ4 and Zstandard binding to Unity and .NET Standard
 * [Cysharp/MagicPhysX](https://github.com/Cysharp/MagicPhysX) : .NET PhysX 5 binding to all platforms(win, osx, linux)
 
 Getting Started
@@ -35,7 +32,7 @@ version = "0.1.0"
 crate-type = ["cdylib"]
 
 [build-dependencies]
-csbindgen = "1.8.0"
+csbindgen = "1.9.6"
 ```
 
 ### Rust to C#.
@@ -50,7 +47,7 @@ pub extern "C" fn my_add(x: i32, y: i32) -> i32 {
 }
 ```
 
-Setup csbindgen code to `build.rs`.
+Setup csbindgen code to `build.rs`, use builder and `input_extern_file`.
 
 ```rust
 fn main() {
@@ -98,24 +95,81 @@ namespace CsBindgen
 
 For example, build [lz4](https://github.com/lz4/lz4) compression library.
 
+#### C to C#
+
+It's almost the same as Rust to C#, but add a reference to bindgen, and first add bindgen generation to `build.rs`. Then in csbindgen's builder, specify `input_bindgen_file` to load the file.
+
+```toml
+[package]
+name = "example"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+csbindgen = "1.9.6"
+bindgen = "0.72.1"
+```
+
 ```rust
-// using bindgen, generate binding code
-bindgen::Builder::default()
-    .header("c/lz4/lz4.h")
-    .generate().unwrap()
-    .write_to_file("lz4.rs").unwrap();
+use std::error::Error;
 
-// using cc, build and link c code
-cc::Build::new().file("lz4.c").compile("lz4");
+fn main() -> Result<(), Box<dyn Error>> {
+    // using bindgen, generate binding code
+   bindgen::Builder::default()
+        .header("c/lz4/lz4.h")
+        .default_enum_style(bindgen::EnumVariation::Rust {
+            non_exhaustive: false,
+        })
+        .generate()?
+        .write_to_file("lz4.rs")?;
+        
+    // csbindgen code, generate C# dll import
+    csbindgen::Builder::default()
+        .input_bindgen_file("lz4.rs") // read from bindgen generated code
+     // .csharp_generate_const_filter(|x| x.starts_with("LZ4_")) // use csharp_generate_const_filter if you want to generate const
+        .generate_csharp_file("../dotnet/NativeMethods.lz4.g.cs")?;
 
-// csbindgen code, generate both rust ffi and C# dll import
-csbindgen::Builder::default()
-    .input_bindgen_file("lz4.rs")            // read from bindgen generated code
-    .rust_file_header("use super::lz4::*;")     // import bindgen generated modules(struct/method)
-    .csharp_entry_point_prefix("csbindgen_") // adjust same signature of rust method and C# EntryPoint
-    .csharp_dll_name("liblz4")
-    .generate_to_file("lz4_ffi.rs", "../dotnet/NativeMethods.lz4.g.cs")
-    .unwrap();
+    Ok(())
+}
+```
+
+In this case, you won't use the Rust binary built. Instead, build the C/C++ library separately using make, cmake, or other tools, and place it accordingly. When targeting OSS libraries, they typically come with make/cmake configurations, so it's best to follow their build procedures to generate the library.
+
+bindgen's `default_enum_style` generates consts. When handling in C#, it would be more practical to generate them as enums. Also, csbindgen does not generate consts by default. By enabling `csharp_generate_const_filter`, consts will be generated on the C# side.
+
+Additionally, types and enums that exist in the input file are all trimmed and not generated if they are not used in method definitions. If you want to generate types or enums on the C# side, you explicitly specify them using `always_included_types`. For example, `.always_included_types(["ZL_StandardGraphID", "ZL_StandardNodeID"])`.
+
+#### C to Rust to C#
+
+You can incorporate and build C code into a Rust library by using the [cc crate](https://crates.io/crates/cc) or [cmake crate](https://crates.io/crates/cmake). In that case, you need to create a flow where C# calls Rust, and Rust calls C. You can automate this entire flow by generating both Rust and C# files with `generate_to_file`.
+
+```rust
+use std::error::Error;
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // using bindgen, generate binding code
+    bindgen::Builder::default()
+        .header("c/lz4/lz4.h")
+        .default_enum_style(bindgen::EnumVariation::Rust {
+            non_exhaustive: false,
+        })
+        .generate().unwrap()
+        .write_to_file("lz4.rs")?;
+
+    // using cc, build and link c code
+    cc::Build::new().file("lz4.c").compile("lz4");
+
+    // csbindgen code, generate both rust ffi and C# dll import
+    csbindgen::Builder::default()
+        .input_bindgen_file("lz4.rs")            // read from bindgen generated code
+        .rust_file_header("use super::lz4::*;")     // import bindgen generated modules(struct/method)
+        .csharp_entry_point_prefix("csbindgen_") // adjust same signature of rust method and C# EntryPoint
+        .csharp_dll_name("liblz4")
+     // .csharp_generate_const_filter(|x| x.starts_with("LZ4_")) // use csharp_generate_const_filter if you want to generate const
+        .generate_to_file("lz4_ffi.rs", "../dotnet/NativeMethods.lz4.g.cs")?;
+}
 ```
 
 It will generates like these code.
@@ -169,8 +223,6 @@ mod lz4;
 mod lz4_ffi;
 ```
 
-
-
 ## Builder options(configure template)
 
 ### Builder options: Rust to C#
@@ -190,11 +242,12 @@ csbindgen::Builder::default()
     .csharp_disable_emit_dll_name(false)    // optional, default: false
     .csharp_imported_namespaces("MyLib")    // optional, default: empty
     .csharp_generate_const_filter (|_|false) // optional, default: `|_|false`
-    .csharp_dll_name_if("UNITY_IOS && !UNITY_EDITOR", "__Internal") // optional, default: ""
+    .csharp_dll_name_if("UNITY_IOS && !UNITY_EDITOR", "__Internal") // optional, default: "", allows multiple call
     .csharp_type_rename(|rust_type_name| match rust_type_name {     // optional, default: `|x| x`
         "FfiConfiguration" => "Configuration".into(),
         _ => x,
     })
+    .always_included_types(["ZL_StandardGraphID", "ZL_StandardNodeID"])` // optional, default: []
     .generate_csharp_file("../dotnet-sandbox/NativeMethods.cs")     // required
     .unwrap();
 ```
@@ -224,7 +277,7 @@ namespace {csharp_namespace}
 }
 ```
 
-`csharp_dll_name_if` is optional. If specified, `#if` allows two DllName to be specified, which is useful if the name must be `__Internal` at iOS build.
+`csharp_dll_name_if` is optional. If specified, `#if` allows two DllName to be specified, which is useful if the name must be `__Internal` at iOS build. This option allows multiple call.
 
 `csharp_disable_emit_dll_name` is optional, if set to true then don't emit `const string __DllName`. It is useful for generate same class-name from different builder.
 
@@ -240,6 +293,8 @@ csbindgen::Builder::default()
 ```
 
 also `csharp_imported_namespaces` can call multiple times.
+
+`always_included_types` is optional. Types and enums that exist in the input file are all trimmed and not generated if they are not used in method definitions. If set name, do not trim and generate type to C#.
 
 ### Unity Callback
 
@@ -276,32 +331,33 @@ callback_test(Method);
 
 ### Builder options: C (to Rust) to C#
 
-`input_bindgen_file` -> setup options -> `generate_to_file` to use C to C# workflow.
+`input_bindgen_file` -> setup options -> `generate_csharp_file` to use C to C# workflow. `input_bindgen_file` -> setup options -> `generate_to_file` to use C to Rust to C# workflow.
 
 ```rust
 csbindgen::Builder::default()
     .input_bindgen_file("src/lz4.rs")             // required
     .method_filter(|x| { x.starts_with("LZ4") } ) // optional, default: |x| !x.starts_with('_')
-    .rust_method_prefix("csbindgen_")             // optional, default: "csbindgen_"
-    .rust_file_header("use super::lz4::*;")       // optional, default: ""
-    .rust_method_type_path("lz4")                 // optional, default: ""
+    .rust_method_prefix("csbindgen_")             // optional, default: "csbindgen_", for C to Rust to C#
+    .rust_file_header("use super::lz4::*;")       // optional, default: "", for C to Rust to C#
+    .rust_method_type_path("lz4")                 // optional, default: "", for C to Rust to C#
     .csharp_dll_name("lz4")                       // required
     .csharp_class_name("NativeMethods")           // optional, default: NativeMethods
     .csharp_namespace("CsBindgen")                // optional, default: CsBindgen
     .csharp_class_accessibility("internal")       // optional, default: internal
-    .csharp_entry_point_prefix("csbindgen_")      // required, you must set same as rust_method_prefix
+    .csharp_entry_point_prefix("csbindgen_")      // optional, default: "", for C to Rust to C#, you must set same as rust_method_prefix
     .csharp_method_prefix("")                     // optional, default: ""
     .csharp_use_function_pointer(true)            // optional, default: true
     .csharp_imported_namespaces("MyLib")          // optional, default: empty
     .csharp_generate_const_filter(|_|false)       // optional, default:|_|false
-    .csharp_dll_name_if("UNITY_IOS && !UNITY_EDITOR", "__Internal")         // optional, default: ""
+    .csharp_dll_name_if("UNITY_IOS && !UNITY_EDITOR", "__Internal") // optional, default: "", allows multiple call
     .csharp_type_rename(|rust_type_name| match rust_type_name.as_str() {    // optional, default: `|x| x`
         "FfiConfiguration" => "Configuration".into(),
         _ => x,
     })
+    .always_included_types(["ZL_StandardGraphID", "ZL_StandardNodeID"])` // optional, default: []
     .csharp_file_header("#if !UNITY_WEBGL")       // optional, default: ""
     .csharp_file_footer("#endif")                 // optional, default: ""
-    .generate_to_file("src/lz4_ffi.rs", "../dotnet-sandbox/lz4_bindgen.cs") // required
+    .generate_to_file("src/lz4_ffi.rs", "../dotnet-sandbox/lz4_bindgen.cs") // for C to Rust to C#, if C to C#, use generate_csharp_file instead.
     .unwrap();
 ```
 
@@ -349,47 +405,47 @@ internal static unsafe partial class NativeMethods
     {
         if (libraryName == __DllName)
         {
-            var path = "runtimes/";
-            var extension = "";
+            var name = libraryName;
+            var ext = "";
+            var prefix = "";
+            var platform = "";
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                path += "win-";
-                extension = ".dll";
+                platform = "win";
+                prefix = "";
+                ext = ".dll";
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             {
-                path += "osx-";
-                extension = ".dylib";
+                platform = "osx";
+                prefix = libraryName.StartsWith("lib") ? "" : "lib";
+                ext = ".dylib";
             }
             else
             {
-                path += "linux-";
-                extension = ".so";
+                platform = "linux";
+                prefix = libraryName.StartsWith("lib") ? "" : "lib";
+                ext = ".so";
             }
 
-            if (RuntimeInformation.ProcessArchitecture == Architecture.X86)
+            var arch = RuntimeInformation.OSArchitecture switch
             {
-                path += "x86";
-            }
-            else if (RuntimeInformation.ProcessArchitecture == Architecture.X64)
-            {
-                path += "x64";
-            }
-            else if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
-            {
-                path += "arm64";
-            }
+                Architecture.Arm64 => "arm64",
+                Architecture.X64 => "x64",
+                Architecture.X86 => "x86",
+                _ => throw new NotSupportedException(),
+            };
 
-            path += "/native/" + __DllName + extension;
-
-            return NativeLibrary.Load(Path.Combine(AppContext.BaseDirectory, path), assembly, searchPath);
+            return NativeLibrary.Load($"runtimes/{platform}-{arch}/native/{prefix}{name}{ext}", assembly, searchPath);
         }
 
         return IntPtr.Zero;
     }
 }
 ```
+
+The naming convention `{platform}-{arch}/native/` is used in [NuGet packaging for native libraries](https://learn.microsoft.com/en-us/nuget/create-packages/native-files-in-net-packages). When pushing to NuGet, if files are arranged according to this naming convention, the DllImportResolver mentioned above is unnecessary and the load path is automatically specified. If not using NuGet, even if files are arranged with the same naming convention, the Resolver mentioned above is still needed.
 
 If Unity, configure Platform settings in each native library's inspector.
 

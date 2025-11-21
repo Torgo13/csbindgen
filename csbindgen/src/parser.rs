@@ -1,3 +1,4 @@
+use crate::doc_comment::gather_docs;
 use crate::type_meta::ExportSymbolNaming::{ExportName, NoMangle};
 use crate::util::get_str_from_meta;
 use crate::{alias_map::AliasMap, builder::BindgenOptions, field_map::FieldMap, type_meta::*};
@@ -13,16 +14,15 @@ enum FnItem {
 /// build a Vec of all Items, unless the Item is a Item::Mod, then append the Item contents of the vect
 /// Do this recursively.
 /// This is not memory-efficient, would work better with an iterator, but does not seem performance critical.
-fn depth_first_module_walk<'a>(ast: &'a Vec<Item>) -> Vec<&'a syn::Item> {
+fn depth_first_module_walk(ast: &[Item]) -> Vec<&syn::Item> {
     let mut unwrapped_items: Vec<&syn::Item> = vec![];
     for item in ast {
         match item {
-            Item::Mod(m) => match &m.content {
-                Some((_, items)) => {
+            Item::Mod(m) => {
+                if let Some((_, items)) = &m.content {
                     unwrapped_items.extend(depth_first_module_walk(items));
                 }
-                _ => {}
-            },
+            }
             _ => {
                 unwrapped_items.push(item);
             }
@@ -77,6 +77,50 @@ fn parse_method(item: FnItem, options: &BindgenOptions) -> Option<ExternMethod> 
 
     let method_name = sig.ident.to_string();
 
+    let is_x86_windows = std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|v| v == "x86")
+        && std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|v| v == "windows");
+    let call_conv = if let Some(abi) = sig.abi.map(|abi| abi.name).flatten() {
+        let abi_str = &abi.value();
+        if abi_str.contains("system") {
+            // For i686-pc-windows-* (32-bit binaries) the default calling convention is stdcall, unlike everywhere else.
+            // See https://doc.rust-lang.org/reference/items/external-blocks.html#abi for a list of possible ABIs and what they translate to.
+            if is_x86_windows {"StdCall"}
+            else {"Cdecl"}
+        }
+        else if abi_str.contains("stdcall") {"StdCall"}
+        else if abi_str.contains("thiscall") {
+            if !is_x86_windows {
+                eprintln!("ThisCall is only allowed on 32-bit MSVC as it's the 32-bit member function calling convention. Consider using \"system\" instead.");
+                panic!("Cannot emit `thiscall` code in Rust for a non-x86 target.");
+            }
+            else {"ThisCall"}
+        }
+        else if abi_str.contains("win64") && (std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|v| v != "windows") || std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|v| v != "x86_64")) {
+            eprintln!("win64 is an AMD64-only calling convention. Consider using \"system\" instead.");
+            panic!("Cannot emit `win64` code in Rust for a non-AMD64-windows target.");
+        }
+        else if abi_str.contains("sysv64") && (std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|v| v == "windows") || std::env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|v| v != "x86_64")) {
+            eprintln!("sysv64 is the calling convention for AMD64 non-windows, consider using \"system\" instead.");
+            panic!("Cannot emit `sysv64` on non-AMD64 and/or windows target.");
+        }
+        else if abi_str.contains("aapcs") {
+            eprintln!("ARM is an extremely complex landscape and not all possible combinations can be checked. Emitting at the user's risk.");
+            "WinApi"
+        }
+        else if abi_str.contains("C") || abi_str.contains("cdecl") || abi_str.contains("win64") || abi_str.contains("sysv64") || abi_str.contains("aapcs") {"Cdecl"}
+        else {
+            // This is only ever hit for the `Rust`, `fastcall`, and `efiapi` calling conventions, none of which are supported by C# (as of .NET 9)
+            // https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.callconvfastcall?view=net-9.0
+            // https://learn.microsoft.com/en-us/dotnet/standard/native-interop/calling-conventions#platform-default-calling-convention
+            // https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.callingconvention?view=net-9.0
+            eprintln!("C# support for calling conventions is limited. Please stick to any of the supported options for interop:");
+            eprintln!("`cdecl` for `Cdecl`, `stdcall` for `StdCall`, `thiscall` for `ThisCall`, `C` for the compiler's default (most likely `Cdecl`), `system` for automatic selection, or your platform-specific target.");
+            panic!("Unsupported calling convention requested! .NET interop does not support {abi_str}, please consider using \"system\" for the extern ABI.");
+        }
+    } else {
+        "Cdecl"
+    }.to_string();
+
     let mut parameters: Vec<Parameter> = Vec::new();
     let mut return_type: Option<RustType> = None;
 
@@ -121,18 +165,7 @@ fn parse_method(item: FnItem, options: &BindgenOptions) -> Option<ExternMethod> 
     if !is_foreign_item {
         let found = attrs
             .iter()
-            .map(|attr| {
-                let name = &attr.path().segments.last().unwrap().ident;
-                if name == "no_mangle" {
-                    return Some(NoMangle);
-                } else if name == "export_name" {
-                    if let Some(x) = get_str_from_meta(&attr.meta) {
-                        return Some(ExportName(x));
-                    }
-                }
-                None
-            })
-            .flatten()
+            .filter_map(|attr| parse_method_attribute(attr))
             .next();
 
         if let Some(x) = found {
@@ -147,22 +180,67 @@ fn parse_method(item: FnItem, options: &BindgenOptions) -> Option<ExternMethod> 
     }
 
     // doc
-    let doc_comment = attrs
-        .iter()
-        .filter(|x| x.path().is_ident("doc"))
-        .filter_map(|x| get_str_from_meta(&x.meta))
-        .collect::<Vec<_>>();
-
     if !method_name.is_empty() && (options.method_filter)(method_name.clone()) {
         return Some(ExternMethod {
             method_name,
             export_naming,
             parameters,
             return_type,
-            doc_comment,
+            doc_comment: gather_docs(&attrs),
+            call_conv,
         });
     }
 
+    None
+}
+
+fn parse_method_attribute(attr: &syn::Attribute) -> Option<ExportSymbolNaming> {
+    let name = &attr.path().segments.last().unwrap().ident;
+
+    match name.to_string().as_str() {
+        "no_mangle" => Some(NoMangle),
+        "export_name" => {
+            if let Some(x) = get_str_from_meta(&attr.meta) {
+                Some(ExportName(x))
+            } else {
+                None
+            }
+        }
+        "unsafe" => parse_method_attribute_arguments(attr),
+        _ => None,
+    }
+}
+
+fn parse_method_attribute_arguments(attr: &syn::Attribute) -> Option<ExportSymbolNaming> {
+    if let syn::Meta::List(_) = attr.meta {
+        let parse_result = attr.parse_args_with(|input: syn::parse::ParseStream| {
+            if input.is_empty() {
+                return Ok(None);
+            }
+
+            let mut result = None;
+            let meta = input.parse::<syn::Meta>()?;
+
+            if let Some(ident) = meta.path().get_ident() {
+                match ident.to_string().as_str() {
+                    "no_mangle" => result = Some(NoMangle),
+                    "export_name" => {
+                        if let Some(x) = get_str_from_meta(&meta) {
+                            result = Some(ExportName(x));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(result)
+        });
+
+        match parse_result {
+            Ok(Some(value)) => return Some(value),
+            Ok(None) => {}
+            Err(e) => println!("csbindgen can't parse attribute args: {}", e),
+        }
+    }
     None
 }
 
@@ -201,6 +279,7 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
                 struct_name,
                 fields,
                 is_union: true,
+                doc_comment: gather_docs(&t.attrs),
             });
         } else if let Item::Struct(t) = item {
             let mut repr = false;
@@ -210,6 +289,7 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
                     repr = true;
                 }
             }
+            let doc_comment = gather_docs(&t.attrs);
 
             if repr {
                 if let syn::Fields::Named(f) = &t.fields {
@@ -219,6 +299,7 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
                         struct_name,
                         fields,
                         is_union: false,
+                        doc_comment,
                     });
                 } else if let syn::Fields::Unnamed(f) = &t.fields {
                     let struct_name = t.ident.to_string();
@@ -227,6 +308,7 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
                         struct_name,
                         fields,
                         is_union: false,
+                        doc_comment,
                     });
                 } else if let syn::Fields::Unit = &t.fields {
                     let struct_name = t.ident.to_string();
@@ -235,6 +317,7 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
                         struct_name,
                         fields,
                         is_union: false,
+                        doc_comment,
                     });
                 }
             } else {
@@ -245,6 +328,7 @@ pub fn collect_struct(ast: &syn::File, result: &mut Vec<RustStruct>) {
                     struct_name,
                     fields,
                     is_union: false,
+                    doc_comment,
                 });
             }
         }
@@ -260,6 +344,7 @@ fn collect_fields(fields: &syn::FieldsNamed) -> Vec<FieldMember> {
             result.push(FieldMember {
                 name: x.to_string(),
                 rust_type: t,
+                doc_comment: gather_docs(&field.attrs),
             });
         }
     }
@@ -276,8 +361,9 @@ fn collect_fields_unnamed(fields: &syn::FieldsUnnamed) -> Vec<FieldMember> {
         let name = format!("Item{i}");
         let t = parse_type(&field.ty);
         result.push(FieldMember {
-            name: name,
+            name,
             rust_type: t,
+            doc_comment: gather_docs(&field.attrs),
         });
     }
 
@@ -319,13 +405,14 @@ pub fn collect_const(
                         syn::Lit::Bool(b) => {
                             format!("{}", b.value)
                         }
-                        _ => format!(""),
+                        _ => String::new(),
                     };
 
                     result.push(RustConst {
-                        const_name: const_name,
+                        const_name,
                         rust_type: t,
-                        value: value,
+                        value,
+                        doc_comment: gather_docs(&ct.attrs),
                     });
                 }
             }
@@ -380,7 +467,11 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
                     _ => (),
                 }
 
-                fields.push((name, value));
+                fields.push(RustEnumVariant {
+                    name,
+                    value,
+                    doc_comment: gather_docs(&v.attrs),
+                });
             }
 
             result.push(RustEnum {
@@ -388,6 +479,7 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
                 fields,
                 repr,
                 is_flags: false,
+                doc_comment: gather_docs(&t.attrs),
             });
         } else if let Item::Macro(t) = item {
             let last_segment = t.mac.path.segments.last().unwrap();
@@ -430,6 +522,12 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
                             ),
                         )
                     })
+                    //TODO: Unsure how to get the doc comments here, left empty for now
+                    .map(|x| RustEnumVariant {
+                        name: x.0,
+                        value: x.1,
+                        doc_comment: Vec::new(),
+                    })
                     .collect::<Vec<_>>();
 
                 result.push(RustEnum {
@@ -437,6 +535,7 @@ pub fn collect_enum(ast: &syn::File, result: &mut Vec<RustEnum>) {
                     fields,
                     repr,
                     is_flags: true,
+                    doc_comment: gather_docs(&t.attrs),
                 });
             }
         }
@@ -526,7 +625,7 @@ fn parse_type(t: &syn::Type) -> RustType {
             };
         }
         syn::Type::Tuple(t) => {
-            if t.elems.len() == 0 {
+            if t.elems.is_empty() {
                 return RustType {
                     type_name: "()".to_string(),
                     type_kind: TypeKind::Normal,
@@ -549,7 +648,7 @@ fn parse_type(t: &syn::Type) -> RustType {
 
             let ret = match &t.output {
                 syn::ReturnType::Default => None,
-                syn::ReturnType::Type(_, t) => Some(Box::new(parse_type(&t))),
+                syn::ReturnType::Type(_, t) => Some(Box::new(parse_type(t))),
             };
 
             return RustType {
@@ -558,7 +657,7 @@ fn parse_type(t: &syn::Type) -> RustType {
             };
         }
         syn::Type::Reference(t) => {
-            let result = parse_type(&*t.elem);
+            let result = parse_type(&t.elem);
             let is_mut = t.mutability.is_some();
 
             match result {
@@ -575,7 +674,7 @@ fn parse_type(t: &syn::Type) -> RustType {
                                 } else {
                                     PointerType::ConstPointer
                                 },
-                                Box::new(parse_type(&*t.elem)),
+                                Box::new(parse_type(&t.elem)),
                             ),
                         };
                     }
@@ -588,7 +687,7 @@ fn parse_type(t: &syn::Type) -> RustType {
                                 } else {
                                     PointerType::ConstPointerPointer
                                 },
-                                Box::new(parse_type(&*t.elem)),
+                                Box::new(parse_type(&t.elem)),
                             ),
                         };
                     }
@@ -601,7 +700,7 @@ fn parse_type(t: &syn::Type) -> RustType {
                                 } else {
                                     PointerType::ConstMutPointerPointer
                                 },
-                                Box::new(parse_type(&*t.elem)),
+                                Box::new(parse_type(&t.elem)),
                             ),
                         };
                     }
@@ -613,7 +712,7 @@ fn parse_type(t: &syn::Type) -> RustType {
                         type_name: result.type_name,
                         type_kind: TypeKind::Pointer(
                             PointerType::ConstPointer,
-                            Box::new(parse_type(&*t.elem)),
+                            Box::new(parse_type(&t.elem)),
                         ),
                     };
                 }
@@ -650,12 +749,14 @@ fn parse_type_path(t: &syn::TypePath) -> RustType {
                     type_name: "Box".to_string(),
                     type_kind: TypeKind::Pointer(PointerType::Box, Box::new(rust_type)),
                 };
+            } else if last_segment.ident == "MaybeUninit" {
+                return rust_type;
             }
         }
     }
 
-    return RustType {
+    RustType {
         type_name: last_segment.ident.to_string(),
         type_kind: TypeKind::Normal,
-    };
+    }
 }

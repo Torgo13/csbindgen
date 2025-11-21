@@ -58,6 +58,7 @@ namespace CsBindgen
         public const uint __USE_FORTIFY_LEVEL = 0;
         public const uint __GLIBC_USE_DEPRECATED_GETS = 0;
         public const uint __GLIBC_USE_DEPRECATED_SCANF = 0;
+        public const uint __GLIBC_USE_C2X_STRTOL = 0;
         public const uint _STDC_PREDEF_H = 1;
         public const uint __STDC_IEC_559__ = 1;
         public const uint __STDC_IEC_60559_BFP__ = 201404;
@@ -66,7 +67,7 @@ namespace CsBindgen
         public const uint __STDC_ISO_10646__ = 201706;
         public const uint __GNU_LIBRARY__ = 6;
         public const uint __GLIBC__ = 2;
-        public const uint __GLIBC_MINOR__ = 35;
+        public const uint __GLIBC_MINOR__ = 39;
         public const uint _SYS_CDEFS_H = 1;
         public const uint __glibc_c99_flexarr_available = 1;
         public const uint __LDOUBLE_REDIRECTS_TO_FLOAT128_ABI = 0;
@@ -90,6 +91,7 @@ namespace CsBindgen
         public const uint _BITS_WCHAR_H = 1;
         public const uint _BITS_STDINT_INTN_H = 1;
         public const uint _BITS_STDINT_UINTN_H = 1;
+        public const uint _BITS_STDINT_LEAST_H = 1;
         public const uint INT8_MAX = 127;
         public const uint INT16_MAX = 32767;
         public const uint INT32_MAX = 2147483647;
@@ -153,6 +155,8 @@ namespace CsBindgen
         public const uint LZ4F_frameType_t_LZ4F_skippableFrame = 1;
         public const uint XXH_errorcode_XXH_OK = 0;
         public const uint XXH_errorcode_XXH_ERROR = 1;
+
+
 
 
         [DllImport(__DllName, EntryPoint = "csbindgen_LZ4_versionNumber", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
@@ -1019,6 +1023,12 @@ namespace CsBindgen
         public LZ4_stream_t_internal internal_donotuse;
     }
 
+    /// <summary>
+    ///  LZ4_streamDecode_t :
+    ///   Never ever use below internal definitions directly !
+    ///   These definitions are not API/ABI safe, and may change in future versions.
+    ///   If you need static allocation, declare or allocate an LZ4_streamDecode_t object.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe partial struct LZ4_streamDecode_t_internal
     {
@@ -1063,6 +1073,13 @@ namespace CsBindgen
         public LZ4HC_CCtx_internal internal_donotuse;
     }
 
+    /// <summary>
+    ///  LZ4F_frameInfo_t :
+    ///   makes it possible to set or read frame parameters.
+    ///   Structure must be first init to 0, using memset() or LZ4F_INIT_FRAMEINFO,
+    ///   setting all parameters to default.
+    ///   It's then possible to update selectively some parameters
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe partial struct LZ4F_frameInfo_t
     {
@@ -1075,6 +1092,13 @@ namespace CsBindgen
         public uint blockChecksumFlag;
     }
 
+    /// <summary>
+    ///  LZ4F_preferences_t :
+    ///   makes it possible to supply advanced compression instructions to streaming interface.
+    ///   Structure must be first init to 0, using memset() or LZ4F_INIT_PREFERENCES,
+    ///   setting all parameters to default.
+    ///   All reserved fields must be set to zero.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe partial struct LZ4F_preferences_t
     {

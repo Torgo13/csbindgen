@@ -1,4 +1,5 @@
 use crate::{alias_map::AliasMap, builder::BindgenOptions};
+use std::collections::HashMap;
 
 pub fn escape_csharp_name(str: &str) -> String {
     match str {
@@ -27,6 +28,7 @@ pub struct Parameter {
 pub struct FieldMember {
     pub name: String,
     pub rust_type: RustType,
+    pub doc_comment: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,38 +44,7 @@ pub struct ExternMethod {
     pub parameters: Vec<Parameter>,
     pub return_type: Option<RustType>,
     pub export_naming: ExportSymbolNaming,
-}
-
-impl ExternMethod {
-    pub fn escape_doc_comment(&self, indent: &str) -> Option<String> {
-        if self.doc_comment.is_empty() {
-            return None;
-        }
-
-        let mut lines = Vec::with_capacity(self.doc_comment.len() + 2);
-
-        lines.push(format!("{}/// <summary>", indent));
-
-        for comment in self.doc_comment.iter() {
-            if comment.trim().is_empty() {
-                lines.push(format!("{}///", indent));
-            } else {
-                for line in comment.lines() {
-                    lines.push(format!(
-                        "{}/// {}",
-                        indent,
-                        line.replace("&", "&amp;")
-                            .replace("<", "&lt;")
-                            .replace(">", "&gt;"),
-                    ));
-                }
-            }
-        }
-
-        lines.push(format!("{}/// </summary>", indent));
-
-        Some(lines.join("\n"))
-    }
+    pub call_conv: String,
 }
 
 #[derive(Clone, Debug)]
@@ -108,14 +79,23 @@ pub struct RustStruct {
     pub struct_name: String,
     pub fields: Vec<FieldMember>,
     pub is_union: bool,
+    pub doc_comment: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RustEnum {
     pub enum_name: String,
-    pub fields: Vec<(String, Option<String>)>, // name, value
+    pub fields: Vec<RustEnumVariant>, // name, value
     pub repr: Option<String>,
     pub is_flags: bool,
+    pub doc_comment: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RustEnumVariant {
+    pub name: String,
+    pub value: Option<String>,
+    pub doc_comment: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +103,7 @@ pub struct RustConst {
     pub const_name: String,
     pub rust_type: RustType,
     pub value: String,
+    pub doc_comment: Vec<String>,
 }
 
 impl RustType {
@@ -142,10 +123,7 @@ impl RustType {
             };
 
             // return NonNull or Box requires close angle
-            match p {
-                NonNull | Box => true,
-                _ => false,
-            }
+            matches!(p, NonNull | Box)
         }
 
         let emit_type_name = |sb: &mut String| {
@@ -225,6 +203,7 @@ impl RustType {
         &self,
         options: &BindgenOptions,
         alias_map: &AliasMap,
+        delegate_list: &mut Vec<String>,
         emit_from_struct: bool,
         method_name: &String,
         parameter_name: &String,
@@ -305,6 +284,7 @@ impl RustType {
             use_type.to_csharp_string(
                 options,
                 alias_map,
+                delegate_list,
                 emit_from_struct,
                 method_name,
                 parameter_name,
@@ -344,6 +324,7 @@ impl RustType {
                         sb.push_str(&p.rust_type.to_csharp_string(
                             options,
                             alias_map,
+                            delegate_list,
                             emit_from_struct,
                             method_name,
                             parameter_name,
@@ -355,6 +336,7 @@ impl RustType {
                             sb.push_str(&x.to_csharp_string(
                                 options,
                                 alias_map,
+                                delegate_list,
                                 emit_from_struct,
                                 method_name,
                                 parameter_name,
@@ -366,6 +348,14 @@ impl RustType {
                     };
                     sb.push('>');
                 } else {
+                    build_method_delegate(
+                        self,
+                        options,
+                        alias_map,
+                        delegate_list,
+                        method_name,
+                        parameter_name,
+                    );
                     sb.push_str(build_method_delegate_name(method_name, parameter_name).as_str());
                 }
             }
@@ -376,6 +366,7 @@ impl RustType {
                         .to_csharp_string(
                             options,
                             alias_map,
+                            delegate_list,
                             emit_from_struct,
                             method_name,
                             parameter_name,
@@ -389,6 +380,7 @@ impl RustType {
                     rust_type: &RustType,
                     options: &BindgenOptions,
                     alias_map: &AliasMap,
+                    delegate_list: &mut Vec<String>,
                     emit_from_struct: bool,
                     method_name: &String,
                     parameter_name: &String,
@@ -398,10 +390,11 @@ impl RustType {
                     if let TypeKind::Pointer(p, inner) = &rust_type.type_kind {
                         if emit_inner {
                             sb.push_str(
-                                &inner
+                                inner
                                     .to_csharp_string(
                                         options,
                                         alias_map,
+                                        delegate_list,
                                         emit_from_struct,
                                         method_name,
                                         parameter_name,
@@ -432,6 +425,7 @@ impl RustType {
                         &use_type,
                         options,
                         alias_map,
+                        delegate_list,
                         emit_from_struct,
                         method_name,
                         parameter_name,
@@ -445,17 +439,17 @@ impl RustType {
 
                 if !emit_pointer(
                     &mut sb,
-                    &self,
+                    self,
                     options,
                     alias_map,
+                    delegate_list,
                     emit_from_struct,
                     method_name,
                     parameter_name,
                     emit_inner,
-                ) {
-                    if emit_inner {
-                        sb.push_str(type_csharp_string.as_str());
-                    }
+                ) && emit_inner
+                {
+                    sb.push_str(type_csharp_string.as_str());
                 }
             }
         };
@@ -464,69 +458,67 @@ impl RustType {
     }
 }
 
-pub fn build_method_delegate_if_required(
+pub fn build_method_delegate(
     me: &RustType,
     options: &BindgenOptions,
     alias_map: &AliasMap,
+    delegate_list: &mut Vec<String>,
     method_name: &String,
     parameter_name: &String,
-) -> Option<String> {
+) {
     let emit_from_struct = false;
 
     match &me.type_kind {
         TypeKind::Function(parameters, return_type) => {
-            if emit_from_struct && !options.csharp_use_function_pointer {
-                None
-            } else if options.csharp_use_function_pointer {
-                None
-            } else {
-                let return_type_name = match return_type {
-                    Some(x) => x.to_csharp_string(
+            let return_type_name = match return_type {
+                Some(x) => x.to_csharp_string(
+                    options,
+                    alias_map,
+                    delegate_list,
+                    emit_from_struct,
+                    &build_method_delegate_name(method_name, parameter_name),
+                    &x.type_name,
+                ),
+                None => "void".to_string(),
+            };
+
+            let joined_param = parameters
+                .iter()
+                .enumerate()
+                .map(|(index, p)| {
+                    let cs = p.rust_type.to_csharp_string(
                         options,
                         alias_map,
+                        delegate_list,
                         emit_from_struct,
-                        method_name,
-                        parameter_name,
-                    ),
-                    None => "void".to_string(),
-                };
+                        &build_method_delegate_name(method_name, parameter_name),
+                        &p.name,
+                    );
+                    let parameter_name = if p.name.is_empty() {
+                        format!("arg{}", index + 1)
+                    } else {
+                        p.name.clone()
+                    };
 
-                let joined_param = parameters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, p)| {
-                        let cs = p.rust_type.to_csharp_string(
-                            options,
-                            alias_map,
-                            emit_from_struct,
-                            method_name,
-                            parameter_name,
-                        );
-                        let parameter_name = if p.name == "" {
-                            format!("arg{}", index + 1)
-                        } else {
-                            p.name.clone()
-                        };
+                    format!("{} {}", cs, escape_csharp_name(parameter_name.as_str()))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
 
-                        format!("{} {}", cs, escape_csharp_name(parameter_name.as_str()))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let delegate_name = build_method_delegate_name(method_name, parameter_name);
-                let delegate_code =
-                    format!("delegate {return_type_name} {delegate_name}({joined_param})");
-                Some(delegate_code)
-            }
+            let delegate_name = build_method_delegate_name(method_name, parameter_name);
+            let delegate_code =
+                format!("delegate {return_type_name} {delegate_name}({joined_param})");
+            delegate_list.push(delegate_code);
         }
-        TypeKind::Option(inner) => build_method_delegate_if_required(
+        TypeKind::Option(inner) => build_method_delegate(
             inner,
             options,
             alias_map,
+            delegate_list,
             method_name,
             parameter_name,
         ),
-        _ => None,
+        _ => (),
     }
 }
 

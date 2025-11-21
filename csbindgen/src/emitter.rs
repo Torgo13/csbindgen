@@ -1,5 +1,6 @@
 use crate::alias_map::AliasMap;
 use crate::builder::BindgenOptions;
+use crate::doc_comment::escape_doc_comment;
 use crate::type_meta::ExportSymbolNaming::{ExportName, NoMangle};
 use crate::type_meta::*;
 use crate::util::*;
@@ -89,68 +90,51 @@ pub fn emit_csharp(
     let method_prefix = &options.csharp_method_prefix;
     let accessibility = &options.csharp_class_accessibility;
 
-    let mut dll_name = match options.csharp_if_symbol.as_str() {
-        "" => format!(
+    let dll_name = if options.csharp_disable_emit_dll_name {
+        "".to_string()
+    } else if options.csharp_if_dll_imports.is_empty() {
+        format!(
             "        const string __DllName = \"{}\";",
             options.csharp_dll_name
-        ),
-        _ => {
-            format!(
-                "#if {0}
-        const string __DllName = \"{1}\";
-#else
-        const string __DllName = \"{2}\";
-#endif
-        ",
-                options.csharp_if_symbol, options.csharp_if_dll_name, options.csharp_dll_name
-            )
+        )
+    } else {
+        let mut s = String::new();
+        for (i, pair) in options.csharp_if_dll_imports.iter().enumerate() {
+            let (if_symbol, if_dll_name) = pair;
+            if i == 0 {
+                s.push_str(
+                    format!(
+                        "#if {if_symbol}\n        const string __DllName = \"{if_dll_name}\";\n"
+                    )
+                    .as_str(),
+                );
+            } else {
+                s.push_str(
+                    format!(
+                        "#elif {if_symbol}\n        const string __DllName = \"{if_dll_name}\";\n"
+                    )
+                    .as_str(),
+                );
+            }
         }
+        s.push_str(
+            format!(
+                "#else\n        const string __DllName = \"{}\";\n#endif\n        ",
+                options.csharp_dll_name
+            )
+            .as_str(),
+        );
+        s
     };
-    if options.csharp_disable_emit_dll_name {
-        dll_name = "".to_string();
-    }
 
     let mut method_list_string = String::new();
+    let mut delegate_list = Vec::new();
     for item in methods {
         let mut method_name = &item.method_name;
         let method_name_temp: String;
         if method_prefix.is_empty() {
             method_name_temp = escape_csharp_name(method_name);
             method_name = &method_name_temp;
-        }
-
-        if let Some(x) = &item.return_type {
-            if let Some(delegate_method) = build_method_delegate_if_required(
-                x,
-                options,
-                aliases,
-                method_name,
-                &"return".to_string(),
-            ) {
-                method_list_string.push_str(
-                    format!("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n")
-                        .as_str(),
-                );
-                method_list_string
-                    .push_str(format!("        {accessibility} {delegate_method};\n\n").as_str());
-            }
-        }
-
-        for p in item.parameters.iter() {
-            if let Some(delegate_method) = build_method_delegate_if_required(
-                &p.rust_type,
-                options,
-                aliases,
-                method_name,
-                &p.name,
-            ) {
-                method_list_string.push_str(
-                    format!("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n")
-                        .as_str(),
-                );
-                method_list_string
-                    .push_str(format!("        {accessibility} {delegate_method};\n\n").as_str());
-            }
         }
 
         let entry_point = match &item.export_naming {
@@ -162,10 +146,16 @@ pub fn emit_csharp(
             "" => format!("{method_prefix}{entry_point}"),
             x => format!("{x}{entry_point}"),
         };
+        let call_conv = &item.call_conv;
         let return_type = match &item.return_type {
-            Some(x) => {
-                x.to_csharp_string(options, aliases, false, method_name, &"return".to_string())
-            }
+            Some(x) => x.to_csharp_string(
+                options,
+                aliases,
+                &mut delegate_list,
+                false,
+                method_name,
+                &"return".to_string(),
+            ),
             None => "void".to_string(),
         };
 
@@ -173,9 +163,14 @@ pub fn emit_csharp(
             .parameters
             .iter()
             .map(|p| {
-                let mut type_name =
-                    p.rust_type
-                        .to_csharp_string(options, aliases, false, method_name, &p.name);
+                let mut type_name = p.rust_type.to_csharp_string(
+                    options,
+                    aliases,
+                    &mut delegate_list,
+                    false,
+                    method_name,
+                    &p.name,
+                );
                 if type_name == "bool" {
                     type_name = "[MarshalAs(UnmanagedType.U1)] bool".to_string();
                 }
@@ -185,12 +180,12 @@ pub fn emit_csharp(
             .collect::<Vec<_>>()
             .join(", ");
 
-        if let Some(x) = item.escape_doc_comment("        ") {
+        if let Some(x) = escape_doc_comment(&item.doc_comment, "        ") {
             method_list_string.push_str_ln(&x);
         }
 
         method_list_string.push_str_ln(
-            format!("        [DllImport(__DllName, EntryPoint = \"{entry_point}\", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]").as_str(),
+            format!("        [DllImport(__DllName, EntryPoint = \"{entry_point}\", CallingConvention = CallingConvention.{call_conv}, ExactSpelling = true)]").as_str(),
         );
         if return_type == "bool" {
             method_list_string.push_str_ln("        [return: MarshalAs(UnmanagedType.U1)]");
@@ -210,12 +205,19 @@ pub fn emit_csharp(
             "Sequential"
         };
 
+        if let Some(doc_comment) = escape_doc_comment(&item.doc_comment, "    ") {
+            structs_string.push_str_ln(&doc_comment);
+        }
+
         structs_string
             .push_str_ln(format!("    [StructLayout(LayoutKind.{layout_kind})]").as_str());
         structs_string
             .push_str_ln(format!("    {accessibility} unsafe partial struct {name}").as_str());
         structs_string.push_str_ln("    {");
         for field in &item.fields {
+            if let Some(doc_comment) = escape_doc_comment(&field.doc_comment, "        ") {
+                structs_string.push_str_ln(&doc_comment);
+            }
             if item.is_union {
                 structs_string.push_str_ln("        [FieldOffset(0)]");
             }
@@ -223,6 +225,7 @@ pub fn emit_csharp(
             let type_name = field.rust_type.to_csharp_string(
                 options,
                 aliases,
+                &mut delegate_list,
                 true,
                 &"".to_string(),
                 &"".to_string(),
@@ -275,6 +278,10 @@ pub fn emit_csharp(
 
     let mut enum_string = String::new();
     for item in enums {
+        if let Some(doc_comment) = escape_doc_comment(&item.doc_comment, "    ") {
+            enum_string.push_str_ln(&doc_comment);
+        }
+
         let repr = match &item.repr {
             Some(x) => format!(" : {}", convert_token_enum_repr(x)),
             None => "".to_string(),
@@ -285,12 +292,16 @@ pub fn emit_csharp(
         }
         enum_string.push_str_ln(format!("    {accessibility} enum {name}{repr}").as_str());
         enum_string.push_str_ln("    {");
-        for (name, value) in &item.fields {
-            let value = match value {
+        for field in &item.fields {
+            if let Some(doc_comment) = escape_doc_comment(&field.doc_comment, "        ") {
+                enum_string.push_str_ln(&doc_comment);
+            }
+
+            let value = match &field.value {
                 Some(x) => format!(" = {x},"),
                 None => ",".to_string(),
             };
-            enum_string.push_str_ln(format!("        {name}{value}").as_str());
+            enum_string.push_str_ln(format!("        {}{}", field.name, value).as_str());
         }
         enum_string.push_str_ln("    }");
         enum_string.push('\n');
@@ -298,9 +309,14 @@ pub fn emit_csharp(
 
     let mut const_string: String = String::new();
     for item in consts {
+        if let Some(doc_comment) = escape_doc_comment(&item.doc_comment, "        ") {
+            const_string.push_str_ln(&doc_comment);
+        }
+
         let mut type_name = item.rust_type.to_csharp_string(
             options,
             aliases,
+            &mut delegate_list,
             false,
             &"".to_string(),
             &"".to_string(),
@@ -343,6 +359,15 @@ pub fn emit_csharp(
         }
     }
 
+    let mut delegate_list_string = String::new();
+    delegate_list.sort();
+    delegate_list.dedup();
+    for delegate in delegate_list {
+        delegate_list_string
+            .push_str("        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n");
+        delegate_list_string.push_str(format!("        {accessibility} {delegate};\n\n").as_str());
+    }
+
     // use empty string if the generated class is empty.
     let class_string = if method_list_string.is_empty() && const_string.is_empty() {
         String::new()
@@ -354,12 +379,14 @@ pub fn emit_csharp(
 
 {const_string}
 
+{delegate_list_string}
+
 {method_list_string}
     }}"
         )
     };
 
-    let file_header = if options.csharp_file_header.len() > 0 {
+    let file_header = if !options.csharp_file_header.is_empty() {
         options.csharp_file_header.to_string() + "\n"
     } else {
         "".to_string()

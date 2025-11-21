@@ -27,8 +27,7 @@ pub struct BindgenOptions {
     pub csharp_class_accessibility: String,
     pub csharp_entry_point_prefix: String,
     pub csharp_method_prefix: String,
-    pub csharp_if_symbol: String,
-    pub csharp_if_dll_name: String,
+    pub csharp_if_dll_imports: Vec<(String, String)>,
     pub csharp_use_function_pointer: bool,
     pub csharp_use_nint_types: bool,
     pub csharp_imported_namespaces: Vec<String>,
@@ -56,8 +55,7 @@ impl Default for Builder {
                 csharp_entry_point_prefix: "".to_string(),
                 csharp_method_prefix: "".to_string(),
                 csharp_class_accessibility: "internal".to_string(),
-                csharp_if_symbol: "".to_string(),
-                csharp_if_dll_name: "".to_string(),
+                csharp_if_dll_imports: vec![],
                 csharp_use_function_pointer: true,
                 csharp_use_nint_types: true,
                 csharp_imported_namespaces: vec![],
@@ -192,8 +190,7 @@ impl Builder {
     /// configure add C# dll name if directive,
     /// #if {if_symbol} __DllName = {if_dll_name}
     pub fn csharp_dll_name_if<T: Into<String>>(mut self, if_symbol: T, if_dll_name: T) -> Builder {
-        self.options.csharp_if_symbol = if_symbol.into();
-        self.options.csharp_if_dll_name = if_dll_name.into();
+        self.options.csharp_if_dll_imports.push((if_symbol.into(), if_dll_name.into()));
         self
     }
 
