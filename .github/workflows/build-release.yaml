@@ -16,19 +16,13 @@ jobs:
   build-and-push-rust:
     permissions:
       contents: write
+      id-token: write # required for crates.io publish
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Load secrets
-        id: op-load-secret
-        uses: 1password/load-secrets-action@13f58eec611f8e5db52ec16247f58c508398f3e6 # v3.0.0
-        with:
-          export-env: false
-        env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN_PUBLIC }}
-          CARGO_REGISTRY_TOKEN: "op://${{ vars.OP_VAULT_ACTIONS_PUBLIC }}/CARGO_REGISTRY_TOKEN/credential"
-
       - uses: Cysharp/Actions/.github/actions/checkout@main
+      - uses: rust-lang/crates-io-auth-action@b7e9a28eded4986ec6b1fa40eeee8f8f165559ec # v1.0.3
+        id: auth
       - run: cargo build --verbose
       - run: cargo test update_package_version -- ${{ inputs.tag }} --nocapture
       - run: |
@@ -36,10 +30,12 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git commit -m "Update cargo.toml version to ${{ inputs.tag }}" -a
       - run: cargo publish --manifest-path csbindgen/Cargo.toml
+        if: ${{ !inputs.dry-run }}
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.op-load-secret.outputs.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - run: git tag ${{ inputs.tag }}
       - name: Push changes
+        if: ${{ !inputs.dry-run }}
         uses: ad-m/github-push-action@77c5b412c50b723d2a4fbc6d71fb5723bcd439aa
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -50,28 +46,30 @@ jobs:
     needs: [build-and-push-rust]
     permissions:
       contents: read
+      id-token: write # required for NuGet Trusted Publish
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Load secrets
-        id: op-load-secret
-        uses: 1password/load-secrets-action@13f58eec611f8e5db52ec16247f58c508398f3e6 # v3.0.0
-        with:
-          export-env: false
-        env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN_PUBLIC }}
-          NUGET_KEY: "op://${{ vars.OP_VAULT_ACTIONS_PUBLIC }}/NUGET_KEY/credential"
-
       - uses: Cysharp/Actions/.github/actions/checkout@main
       - uses: Cysharp/Actions/.github/actions/setup-dotnet@main
-      # pack nuget
+      # pack nuget (.nupkg and .symbols.nupkg will be created)
       - run: dotnet build -c Release -p:Version=${{ inputs.tag }}
-      - run: dotnet pack -c Release --no-build -p:Version=${{ inputs.tag }} -o ./publish
+      - run: dotnet pack -c Release --no-build -p:Version=${{ inputs.tag }} -p:IncludeSymbols=true -o ./publish
       - uses: Cysharp/Actions/.github/actions/upload-artifact@main
         with:
           name: nuget
           path: ./publish
           retention-days: 1
+      # push nuget
+      - name: NuGet login (OIDC)
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+      - run: dotnet nuget push "./publish/*.nupkg" --skip-duplicate -s https://api.nuget.org/v3/index.json -k "${NUGET_KEY}"
+        if: ${{ !inputs.dry-run }}
+        env:
+          NUGET_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
 
   create-release:
     needs: [build-dotnet, build-and-push-rust]
@@ -83,6 +81,6 @@ jobs:
       commit-id: ""
       dry-run: ${{ inputs.dry-run }}
       tag: ${{ inputs.tag }}
-      nuget-push: true
+      nuget-push: false
       release-upload: false
     secrets: inherit
