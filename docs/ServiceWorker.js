@@ -1,4 +1,4 @@
-const cacheName = "TW0CATS GAMES LTD-Oh No! More Nonograms-0.1.0";
+const cacheName = "TW0CATS GAMES LTD-Oh No! More Nonograms-0.1.1";
 const contentToCache = [
     "Build/docs.loader.js",
     "Build/docs.framework.js.unityweb",
